@@ -138,14 +138,15 @@ async function fetchPlaylistWithToken(playlistId, token) {
   const metaText = await metaRes.text();
   console.log('Playlist meta response:', metaRes.status, metaText.substring(0, 200));
   if (!metaRes.ok) throw new Error(`Playlist not found or not accessible (${metaRes.status}): ${metaText}`);
-  const meta = await metaRes.json();
+  const meta = JSON.parse(metaText);
 
   const tracks = [];
   let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100&fields=next,items(track(id,name,artists,album(name,release_date)))`;
   while (url) {
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
-    if (!res.ok) throw new Error(`Failed to fetch tracks: ${res.status}`);
-    const data = await res.json();
+    const resText = await res.text();
+    if (!res.ok) throw new Error(`Failed to fetch tracks: ${res.status}: ${resText.substring(0,100)}`);
+    const data = JSON.parse(resText);
     for (const item of data.items) {
       const track = item.track;
       if (!track || !track.id) continue;
