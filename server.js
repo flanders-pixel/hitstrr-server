@@ -1,4 +1,5 @@
 const express = require('express');
+const QRCode = require('qrcode');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
@@ -112,6 +113,38 @@ function parseCSVLine(line) {
   return result;
 }
 
+// ── QR code generation ───────────────────────────────────────────────────────
+// Cache generated QR codes in memory (survives restarts via file)
+const QR_CACHE_FILE = path.join(__dirname, 'qr_cache.json');
+let qrCache = {};
+try { qrCache = JSON.parse(fs.readFileSync(QR_CACHE_FILE, 'utf8')); } catch(e) {}
+
+function saveQRCache() {
+  try { fs.writeFileSync(QR_CACHE_FILE, JSON.stringify(qrCache)); } catch(e) {}
+}
+
+async function generateQR(spotifyId) {
+  if (qrCache[spotifyId]) return qrCache[spotifyId];
+  const url = `https://open.spotify.com/track/${spotifyId}`;
+  const svg = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'M', margin: 2 });
+  const pathMatch = svg.match(/stroke="#000000" d="([^"]+)"/);
+  const viewBox = svg.match(/viewBox="([^"]+)"/)?.[1];
+  if (!pathMatch || !viewBox) throw new Error('QR generation failed');
+  const data = { d: pathMatch[1], vb: viewBox };
+  qrCache[spotifyId] = data;
+  saveQRCache();
+  return data;
+}
+
+// Pre-generate QR codes for all tracks in a playlist (async, non-blocking)
+async function preGenerateQRCodes(tracks) {
+  for (const track of tracks) {
+    if (!qrCache[track.id]) {
+      try { await generateQR(track.id); } catch(e) { /* skip */ }
+    }
+  }
+}
+
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 // POST /playlists is the only endpoint that spends our Spotify quota (and it
 // amplifies: one request paginates the whole playlist). Cap it so a bad actor
@@ -180,6 +213,8 @@ app.post('/playlists', addPlaylistLimiter, async (req, res) => {
     const playlist = { spotifyId: playlistId, name: meta.name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
+    // Pre-generate QR codes in background (don't await — let it happen async)
+    preGenerateQRCodes(tracks).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -230,6 +265,8 @@ app.post('/playlists/import-csv', (req, res) => {
     const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: 0, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
+    // Pre-generate QR codes in background
+    preGenerateQRCodes(tracks).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -267,6 +304,16 @@ app.patch('/playlists/:id', (req, res) => {
   if (emoji) playlists[idx].emoji = emoji;
   savePlaylists(playlists);
   res.json(playlists[idx]);
+});
+
+// Get QR code for a track
+app.get('/qr/:trackId', async (req, res) => {
+  try {
+    const data = await generateQR(req.params.trackId);
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: 'QR generation failed' });
+  }
 });
 
 // Delete playlist
