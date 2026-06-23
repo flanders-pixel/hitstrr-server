@@ -1,9 +1,13 @@
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
+// Railway (and most hosts) run the app behind a proxy, so the client IP is in
+// X-Forwarded-For. Trust one proxy hop so the rate limiter keys on the real IP.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, 'playlists.json');
 
@@ -15,7 +19,7 @@ if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
 }
 
 app.use(cors({
-  origin: ['https://flanders-pixel.github.io', 'http://localhost:3000', 'http://localhost:8080'],
+  origin: ['https://flanders-pixel.github.io', 'http://localhost:3000', 'http://localhost:8080', 'http://127.0.0.1:8080'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -108,14 +112,28 @@ function parseCSVLine(line) {
   return result;
 }
 
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+// POST /playlists is the only endpoint that spends our Spotify quota (and it
+// amplifies: one request paginates the whole playlist). Cap it so a bad actor
+// who finds the site can't run the Spotify app into rate limits / suspension.
+const addPlaylistLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 40,                  // 20 playlist adds per IP per hour
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many playlists added from this IP. Try again later.' },
+});
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
+// Serve the frontend (index.html lives alongside server.js)
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
 app.get('/playlists', (req, res) => res.json(loadPlaylists()));
 
 // Add playlist by Spotify URL
-app.post('/playlists', async (req, res) => {
+app.post('/playlists', addPlaylistLimiter, async (req, res) => {
   const { url, emoji } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   const playlistId = extractPlaylistId(url);
