@@ -105,10 +105,13 @@ async function mbThrottle() {
 async function lookupOriginalYear(title, artist) {
   try {
     await mbThrottle();
-    const cleanTitle = title.replace(/\s*[-\u2013\u2014]\s*(stereo|mono|remaster.*|single.*|album.*|live.*|remix.*)$/i, '').trim();
+    const cleanTitle = title
+      .replace(/\s*[-\u2013\u2014]\s*(stereo|mono|remaster.*|single.*|album.*|live.*|remix.*|radio.*|edit.*)$/i, '')
+      .replace(/\s*[\(\[][^\)\]]*(remaster|version|edit|mix|live|mono|stereo)[^\)\]]*[\)\]]\s*$/i, '')
+      .trim();
     const cleanArtist = artist.split(' & ')[0].trim();
     const query = encodeURIComponent('"' + cleanTitle + '" AND artist:"' + cleanArtist + '"');
-    const url = 'https://musicbrainz.org/ws/2/recording/?query=' + query + '&limit=5&fmt=json';
+    const url = 'https://musicbrainz.org/ws/2/recording/?query=' + query + '&limit=8&fmt=json';
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Hitstrr/1.0 (music timeline game)' }
     });
@@ -117,6 +120,9 @@ async function lookupOriginalYear(title, artist) {
     if (!data.recordings || !data.recordings.length) return null;
     let earliest = null;
     for (const rec of data.recordings) {
+      // Only trust strong matches — fuzzy hits on similarly-named songs
+      // can otherwise drag the year to something unrelated.
+      if ((rec.score || 0) < 90) continue;
       const recDate = parseInt((rec['first-release-date'] || '').substring(0, 4));
       if (recDate > 1900 && recDate <= new Date().getFullYear()) {
         if (!earliest || recDate < earliest) earliest = recDate;
@@ -135,12 +141,12 @@ async function lookupOriginalYear(title, artist) {
   }
 }
 
-async function autoCorrectYears(tracks) {
-  const flagged = tracks.filter(t => t.yearWarning);
-  if (!flagged.length) return;
-  console.log('Auto-correcting ' + flagged.length + ' flagged tracks via MusicBrainz...');
+async function autoCorrectYears(tracks, checkAll) {
+  const targets = checkAll ? tracks : tracks.filter(t => t.yearWarning);
+  if (!targets.length) return 0;
+  console.log((checkAll ? 'Verifying ' : 'Auto-correcting ') + targets.length + ' tracks via MusicBrainz...');
   let corrected = 0;
-  for (const track of flagged) {
+  for (const track of targets) {
     const mbYear = await lookupOriginalYear(track.title, track.artist);
     if (mbYear && mbYear < track.year) {
       console.log('  ' + track.title + ': ' + track.year + ' -> ' + mbYear);
@@ -151,10 +157,41 @@ async function autoCorrectYears(tracks) {
     } else if (mbYear && mbYear === track.year) {
       track.yearWarning = null;
       track.yearCorrected = true;
-      corrected++;
     }
   }
-  console.log('  Done: ' + corrected + '/' + flagged.length + ' corrected, ' + (flagged.length - corrected) + ' still flagged.');
+  console.log('  Done: ' + corrected + ' corrected.');
+  return corrected;
+}
+
+// Full MusicBrainz verification of a stored playlist, run in the background.
+// Spotify reports the *album's* release date, so tracks on reissues and
+// compilations with innocent names ("Rare Cult") slip past the keyword
+// heuristic. This checks every track and persists any corrections by
+// re-loading storage at write time to avoid clobbering concurrent changes.
+let verifyQueue = Promise.resolve();
+function scheduleFullYearVerify(spotifyId) {
+  verifyQueue = verifyQueue.then(async () => {
+    const pl = loadPlaylists().find(p => p.spotifyId === spotifyId);
+    if (!pl) return;
+    console.log('Background year verify: ' + pl.name + ' (' + pl.tracks.length + ' tracks)');
+    const copies = pl.tracks.map(t => ({ ...t }));
+    await autoCorrectYears(copies, true);
+    const byId = {};
+    copies.forEach(t => { byId[t.id] = t; });
+    const fresh = loadPlaylists();
+    const target = fresh.find(p => p.spotifyId === spotifyId);
+    if (!target) return;
+    let changed = 0;
+    target.tracks.forEach(t => {
+      const c = byId[t.id];
+      if (c && c.year !== t.year) { t.year = c.year; t.yearWarning = c.yearWarning; t.yearCorrected = true; changed++; }
+      else if (c && c.yearCorrected && !t.yearCorrected) { t.yearWarning = c.yearWarning; t.yearCorrected = true; }
+    });
+    target.flaggedCount = target.tracks.filter(t => t.yearWarning).length;
+    target.yearsVerifiedAt = new Date().toISOString();
+    savePlaylists(fresh);
+    console.log('Background year verify done: ' + pl.name + ' — ' + changed + ' years corrected');
+  }).catch(e => console.error('Background year verify failed:', e.message));
 }
 
 // ── QR code generation ───────────────────────────────────────────────────────
@@ -274,6 +311,8 @@ app.post('/playlists', addPlaylistLimiter, async (req, res) => {
     const playlist = { spotifyId: playlistId, name: meta.name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
+    // Verify all years against MusicBrainz in the background
+    scheduleFullYearVerify(playlistId);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -295,6 +334,7 @@ app.post('/playlists/import-csv', async (req, res) => {
     const titleIdx = col('track name');
     const artistIdx = col('artist name');
     const dateIdx = col('release date');
+    const albumIdx = col('album name');
 
     if (uriIdx === -1 || titleIdx === -1) {
       return res.status(400).json({ error: 'CSV missing required columns. Please export from exportify.net' });
@@ -313,8 +353,14 @@ app.post('/playlists/import-csv', async (req, res) => {
       const artist = (cols[artistIdx] || '').replace(/;/g, ' & ');
       const rawDate = dateIdx !== -1 ? (cols[dateIdx] || '') : '';
       const year = parseInt(rawDate.substring(0, 4)) || 0;
+      const albumName = albumIdx !== -1 ? (cols[albumIdx] || '') : '';
       if (!title) continue;
-      tracks.push({ id, title: cleanTitle(title), artist, year, yearWarning: null });
+      tracks.push({
+        id, title: cleanTitle(title), artist, year,
+        yearWarning: isLikelyRemaster(albumName)
+          ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release`
+          : null,
+      });
     }
 
     if (!tracks.length) return res.status(400).json({ error: 'No valid tracks found in CSV' });
@@ -333,8 +379,9 @@ app.post('/playlists/import-csv', async (req, res) => {
     const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
-    // Pre-generate QR codes in background
+    // Pre-generate QR codes and verify all years in background
     preGenerateQRCodes(playlist.tracks).catch(() => {});
+    scheduleFullYearVerify(spotifyId);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -391,6 +438,35 @@ app.delete('/playlists/:id', (req, res) => {
   if (filtered.length === playlists.length) return res.status(404).json({ error: 'Not found' });
   savePlaylists(filtered);
   res.json({ success: true });
+});
+
+// Re-verify all years in an existing playlist against MusicBrainz (background)
+app.post('/playlists/:id/recheck-years', (req, res) => {
+  const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
+  if (!pl) return res.status(404).json({ error: 'Not found' });
+  scheduleFullYearVerify(pl.spotifyId);
+  res.json({ success: true, message: 'Verifying ' + pl.tracks.length + ' tracks in background (~' + Math.ceil(pl.tracks.length * 1.2 / 60) + ' min)' });
+});
+
+// Manually correct a single track's year (fallback when MusicBrainz misses)
+app.patch('/playlists/:id/tracks/:trackId', (req, res) => {
+  const year = parseInt(req.body?.year);
+  if (!year || year < 1900 || year > new Date().getFullYear()) {
+    return res.status(400).json({ error: 'Valid year is required' });
+  }
+  const playlists = loadPlaylists();
+  const pl = playlists.find(p => p.spotifyId === req.params.id);
+  if (!pl) return res.status(404).json({ error: 'Playlist not found' });
+  const track = pl.tracks.find(t => t.id === req.params.trackId);
+  if (!track) return res.status(404).json({ error: 'Track not found' });
+  const oldYear = track.year;
+  track.year = year;
+  track.yearWarning = null;
+  track.yearCorrected = true;
+  pl.flaggedCount = pl.tracks.filter(t => t.yearWarning).length;
+  savePlaylists(playlists);
+  console.log('Manual year fix: ' + track.title + ' ' + oldYear + ' -> ' + year);
+  res.json({ success: true, track });
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Hitstrr server running on port ${PORT}`));
