@@ -1,5 +1,4 @@
 const express = require('express');
-const QRCode = require('qrcode');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
@@ -92,6 +91,71 @@ function extractPlaylistId(input) {
   return null;
 }
 
+
+// ── MusicBrainz original year lookup ─────────────────────────────────────────
+let mbLastCall = 0;
+async function mbThrottle() {
+  const now = Date.now();
+  const wait = 1100 - (now - mbLastCall);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  mbLastCall = Date.now();
+}
+
+async function lookupOriginalYear(title, artist) {
+  try {
+    await mbThrottle();
+    const cleanTitle = title.replace(/\s*[-\u2013\u2014]\s*(stereo|mono|remaster.*|single.*|album.*|live.*|remix.*)$/i, '').trim();
+    const cleanArtist = artist.split(' & ')[0].trim();
+    const query = encodeURIComponent('"' + cleanTitle + '" AND artist:"' + cleanArtist + '"');
+    const url = 'https://musicbrainz.org/ws/2/recording/?query=' + query + '&limit=5&fmt=json';
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Hitstrr/1.0 (music timeline game)' }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.recordings || !data.recordings.length) return null;
+    let earliest = null;
+    for (const rec of data.recordings) {
+      const recDate = parseInt((rec['first-release-date'] || '').substring(0, 4));
+      if (recDate > 1900 && recDate <= new Date().getFullYear()) {
+        if (!earliest || recDate < earliest) earliest = recDate;
+      }
+      if (!rec.releases) continue;
+      for (const release of rec.releases) {
+        const year = parseInt((release.date || '').substring(0, 4));
+        if (year > 1900 && year <= new Date().getFullYear()) {
+          if (!earliest || year < earliest) earliest = year;
+        }
+      }
+    }
+    return earliest;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function autoCorrectYears(tracks) {
+  const flagged = tracks.filter(t => t.yearWarning);
+  if (!flagged.length) return;
+  console.log('Auto-correcting ' + flagged.length + ' flagged tracks via MusicBrainz...');
+  let corrected = 0;
+  for (const track of flagged) {
+    const mbYear = await lookupOriginalYear(track.title, track.artist);
+    if (mbYear && mbYear < track.year) {
+      console.log('  ' + track.title + ': ' + track.year + ' -> ' + mbYear);
+      track.year = mbYear;
+      track.yearWarning = null;
+      track.yearCorrected = true;
+      corrected++;
+    } else if (mbYear && mbYear === track.year) {
+      track.yearWarning = null;
+      track.yearCorrected = true;
+      corrected++;
+    }
+  }
+  console.log('  Done: ' + corrected + '/' + flagged.length + ' corrected, ' + (flagged.length - corrected) + ' still flagged.');
+}
+
 // ── CSV parser ────────────────────────────────────────────────────────────────
 function parseCSVLine(line) {
   const result = [];
@@ -111,38 +175,6 @@ function parseCSVLine(line) {
   }
   result.push(current.trim());
   return result;
-}
-
-// ── QR code generation ───────────────────────────────────────────────────────
-// Cache generated QR codes in memory (survives restarts via file)
-const QR_CACHE_FILE = path.join(__dirname, 'qr_cache.json');
-let qrCache = {};
-try { qrCache = JSON.parse(fs.readFileSync(QR_CACHE_FILE, 'utf8')); } catch(e) {}
-
-function saveQRCache() {
-  try { fs.writeFileSync(QR_CACHE_FILE, JSON.stringify(qrCache)); } catch(e) {}
-}
-
-async function generateQR(spotifyId) {
-  if (qrCache[spotifyId]) return qrCache[spotifyId];
-  const url = `https://open.spotify.com/track/${spotifyId}`;
-  const svg = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'M', margin: 2 });
-  const pathMatch = svg.match(/stroke="#000000" d="([^"]+)"/);
-  const viewBox = svg.match(/viewBox="([^"]+)"/)?.[1];
-  if (!pathMatch || !viewBox) throw new Error('QR generation failed');
-  const data = { d: pathMatch[1], vb: viewBox };
-  qrCache[spotifyId] = data;
-  saveQRCache();
-  return data;
-}
-
-// Pre-generate QR codes for all tracks in a playlist (async, non-blocking)
-async function preGenerateQRCodes(tracks) {
-  for (const track of tracks) {
-    if (!qrCache[track.id]) {
-      try { await generateQR(track.id); } catch(e) { /* skip */ }
-    }
-  }
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -210,18 +242,17 @@ app.post('/playlists', addPlaylistLimiter, async (req, res) => {
     }
 
     if (!tracks.length) return res.status(400).json({ error: 'Playlist has no playable tracks' });
+    await autoCorrectYears(tracks);
     const playlist = { spotifyId: playlistId, name: meta.name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
-    // Pre-generate QR codes in background (don't await — let it happen async)
-    preGenerateQRCodes(tracks).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // Import playlist from Exportify CSV
-app.post('/playlists/import-csv', (req, res) => {
+app.post('/playlists/import-csv', async (req, res) => {
   const { csv, name, emoji } = req.body;
   if (!csv) return res.status(400).json({ error: 'csv is required' });
   if (!name) return res.status(400).json({ error: 'name is required' });
@@ -260,13 +291,20 @@ app.post('/playlists/import-csv', (req, res) => {
 
     if (!tracks.length) return res.status(400).json({ error: 'No valid tracks found in CSV' });
 
+    // Flag tracks with year=0 or likely wrong years before MusicBrainz check
+    tracks.forEach(t => {
+      if (!t.year || t.year === 0) t.yearWarning = 'Year missing';
+    });
+
     const spotifyId = 'csv_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 30) + '_' + Date.now();
     const existing = loadPlaylists();
-    const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: 0, addedAt: new Date().toISOString() };
+
+    // Auto-correct flagged years via MusicBrainz
+    await autoCorrectYears(tracks);
+
+    const playlist = { spotifyId, name, emoji: emoji || '🎵', tracks, flaggedCount: tracks.filter(t => t.yearWarning).length, addedAt: new Date().toISOString() };
     savePlaylists([...existing, playlist]);
     res.json({ success: true, playlist });
-    // Pre-generate QR codes in background
-    preGenerateQRCodes(tracks).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -304,16 +342,6 @@ app.patch('/playlists/:id', (req, res) => {
   if (emoji) playlists[idx].emoji = emoji;
   savePlaylists(playlists);
   res.json(playlists[idx]);
-});
-
-// Get QR code for a track
-app.get('/qr/:trackId', async (req, res) => {
-  try {
-    const data = await generateQR(req.params.trackId);
-    res.json(data);
-  } catch(e) {
-    res.status(500).json({ error: 'QR generation failed' });
-  }
 });
 
 // Delete playlist
