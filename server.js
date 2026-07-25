@@ -260,6 +260,38 @@ const addPlaylistLimiter = rateLimit({
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
+// Stateless MusicBrainz year verification. Accepts { tracks: [{title,artist,year,id}] },
+// runs the same original-year lookup used on import, and returns the corrected
+// tracks. Touches no storage — used to bake correct composition years into the
+// bundled (in-HTML) playlists. Runs synchronously; ~1.1s/track, so send in chunks.
+app.post('/verify-years', async (req, res) => {
+  const tracks = req.body?.tracks;
+  if (!Array.isArray(tracks) || !tracks.length) {
+    return res.status(400).json({ error: 'tracks array is required' });
+  }
+  if (tracks.length > 120) {
+    return res.status(400).json({ error: 'Send at most 120 tracks per request (MusicBrainz throttle). Chunk it.' });
+  }
+  try {
+    const copies = tracks.map(t => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      year: parseInt(t.year) || 0,
+      yearWarning: t.yearWarning || 'unverified',
+    }));
+    const corrected = await autoCorrectYears(copies, true);
+    res.json({
+      success: true,
+      corrected,
+      changedCount: corrected,
+      tracks: copies.map(t => ({ id: t.id, title: t.title, artist: t.artist, year: t.year, yearCorrected: !!t.yearCorrected })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/playlists', (req, res) => res.json(loadPlaylists()));
 
 // Add playlist by Spotify URL
