@@ -387,6 +387,92 @@ app.post('/playlists/import-csv', async (req, res) => {
   }
 });
 
+// Merge an Exportify CSV into an EXISTING playlist (append + dedup by track id),
+// then background-verify all years via MusicBrainz. Used to grow the classical
+// playlist rather than create a separate one.
+app.post('/playlists/:id/merge-csv', async (req, res) => {
+  const { csv } = req.body;
+  if (!csv) return res.status(400).json({ error: 'csv is required' });
+
+  const playlists = loadPlaylists();
+  const target = playlists.find(p => p.spotifyId === req.params.id);
+  if (!target) return res.status(404).json({ error: 'Playlist not found' });
+
+  try {
+    const lines = csv.trim().split('\n');
+    if (lines.length < 2) return res.status(400).json({ error: 'CSV appears empty' });
+
+    const header = parseCSVLine(lines[0]);
+    const col = (name) => header.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+    const uriIdx = col('track uri');
+    const titleIdx = col('track name');
+    const artistIdx = col('artist name');
+    const dateIdx = col('release date');
+    const albumIdx = col('album name');
+
+    if (uriIdx === -1 || titleIdx === -1) {
+      return res.status(400).json({ error: 'CSV missing required columns. Please export from exportify.net' });
+    }
+
+    // Seed the dedup set with tracks ALREADY in the target playlist, so the
+    // merge removes duplicates across both the existing playlist and the CSV.
+    const seen = new Set(target.tracks.map(t => t.id));
+    const existingCount = target.tracks.length;
+    const newTracks = [];
+    let dupCsvInternal = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i]);
+      if (cols.length < 2) continue;
+      const uri = cols[uriIdx] || '';
+      const id = uri.replace('spotify:track:', '').trim();
+      if (!id) continue;
+      if (seen.has(id)) { dupCsvInternal++; continue; }
+      seen.add(id);
+      const title = cols[titleIdx] || '';
+      const artist = (cols[artistIdx] || '').replace(/;/g, ' & ');
+      const rawDate = dateIdx !== -1 ? (cols[dateIdx] || '') : '';
+      const year = parseInt(rawDate.substring(0, 4)) || 0;
+      const albumName = albumIdx !== -1 ? (cols[albumIdx] || '') : '';
+      if (!title) continue;
+      newTracks.push({
+        id, title: cleanTitle(title), artist, year,
+        yearWarning: isLikelyRemaster(albumName)
+          ? `Album "${albumName}" may be a remaster or compilation — year ${year} may not be the original release`
+          : null,
+      });
+    }
+
+    newTracks.forEach(t => { if (!t.year || t.year === 0) t.yearWarning = 'Year missing'; });
+
+    if (!newTracks.length) {
+      return res.json({ success: true, added: 0, duplicatesSkipped: dupCsvInternal, total: existingCount, message: 'No new tracks — everything in the CSV was already in the playlist.' });
+    }
+
+    // Auto-correct flagged years on the NEW tracks before storing.
+    await autoCorrectYears(newTracks);
+
+    target.tracks = [...target.tracks, ...newTracks];
+    target.flaggedCount = target.tracks.filter(t => t.yearWarning).length;
+    target.mergedAt = new Date().toISOString();
+    savePlaylists(playlists);
+
+    res.json({
+      success: true,
+      added: newTracks.length,
+      duplicatesSkipped: dupCsvInternal,
+      total: target.tracks.length,
+      playlist: target.name,
+    });
+
+    // Pre-generate QR codes for the new tracks and full-verify years in background.
+    preGenerateQRCodes(newTracks).catch(() => {});
+    scheduleFullYearVerify(target.spotifyId);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Get flagged tracks
 app.get('/playlists/:id/flags', (req, res) => {
   const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
