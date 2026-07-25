@@ -260,6 +260,60 @@ const addPlaylistLimiter = rateLimit({
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API' }));
 
+// Export a stored (already MusicBrainz-scanned) playlist's tracks straight into
+// the frontend repo as scan-result.json, so its corrected years can be baked
+// into the bundled klassiskt playlist. Uses GITHUB_TOKEN from the environment —
+// the token is never sent to the browser. Trigger once, after the background
+// year-verify has finished for the imported playlist.
+app.post('/export-to-repo/:id', async (req, res) => {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) return res.status(500).json({ error: 'GITHUB_TOKEN not set in environment' });
+
+  const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
+  if (!pl) return res.status(404).json({ error: 'Playlist not found' });
+
+  const repo = 'flanders-pixel/hitstrr';
+  const outPath = 'scan-result.json';
+  const tracks = pl.tracks.map(t => ({ id: t.id, title: t.title, artist: t.artist, year: t.year }));
+  const content = Buffer.from(JSON.stringify(tracks), 'utf8').toString('base64');
+
+  try {
+    let sha = null;
+    const g = await fetch(`https://api.github.com/repos/${repo}/contents/${outPath}`, {
+      headers: { 'Authorization': `token ${token}`, 'User-Agent': 'Hitstrr-server' }
+    });
+    if (g.ok) sha = (await g.json()).sha;
+
+    const body = {
+      message: `Export scanned playlist "${pl.name}" (${tracks.length} tracks) for bundle merge`,
+      content,
+    };
+    if (sha) body.sha = sha;
+
+    const r = await fetch(`https://api.github.com/repos/${repo}/contents/${outPath}`, {
+      method: 'PUT',
+      headers: { 'Authorization': `token ${token}`, 'User-Agent': 'Hitstrr-server', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const errText = await r.text();
+      return res.status(500).json({ error: `GitHub push failed (${r.status}): ${errText.slice(0, 200)}` });
+    }
+    const result = await r.json();
+    const flagged = pl.tracks.filter(t => t.yearWarning).length;
+    res.json({
+      success: true,
+      exported: tracks.length,
+      stillFlagged: flagged,
+      yearsVerifiedAt: pl.yearsVerifiedAt || null,
+      commit: result.commit?.sha,
+      message: `Exported ${tracks.length} tracks to ${outPath}. ${flagged} still flagged. Tell Claude "exported".`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Stateless MusicBrainz year verification. Accepts { tracks: [{title,artist,year,id}] },
 // runs the same original-year lookup used on import, and returns the corrected
 // tracks. Touches no storage — used to bake correct composition years into the
