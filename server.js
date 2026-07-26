@@ -269,8 +269,12 @@ app.post('/export-to-repo/:id', async (req, res) => {
   const token = req.body?.token || process.env.GITHUB_TOKEN;
   if (!token) return res.status(500).json({ error: 'GITHUB_TOKEN not set in environment' });
 
-  const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
-  if (!pl) return res.status(404).json({ error: 'Playlist not found' });
+  const all = loadPlaylists();
+  const key = decodeURIComponent(req.params.id);
+  const pl = key === 'latest'
+    ? all[all.length - 1]
+    : all.find(p => p.spotifyId === key || p.name === key);
+  if (!pl) return res.status(404).json({ error: `Playlist not found. Available: ${all.map(p => p.name).join(', ') || '(none stored)'}` });
 
   const repo = 'flanders-pixel/hitstrr';
   const outPath = 'scan-result.json';
