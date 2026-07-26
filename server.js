@@ -265,7 +265,19 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API'
 // into the bundled klassiskt playlist. Uses GITHUB_TOKEN from the environment —
 // the token is never sent to the browser. Trigger once, after the background
 // year-verify has finished for the imported playlist.
+// GET variant so it can be triggered by simply visiting a URL in a phone browser:
+//   /export-to-repo-get/latest?token=ghp_xxx   (or ?name=Classical%20bangers)
+app.get('/export-to-repo-get/:id', (req, res) => {
+  req.body = { token: req.query.token };
+  if (req.query.name) req.params.id = req.query.name;
+  return exportToRepoHandler(req, res);
+});
+
 app.post('/export-to-repo/:id', async (req, res) => {
+  return exportToRepoHandler(req, res);
+});
+
+async function exportToRepoHandler(req, res) {
   const token = req.body?.token || process.env.GITHUB_TOKEN;
   if (!token) return res.status(500).json({ error: 'GITHUB_TOKEN not set in environment' });
 
@@ -316,7 +328,7 @@ app.post('/export-to-repo/:id', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
 
 // Stateless MusicBrainz year verification. Accepts { tracks: [{title,artist,year,id}] },
 // runs the same original-year lookup used on import, and returns the corrected
