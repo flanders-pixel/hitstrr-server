@@ -266,7 +266,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Hitstrr API'
 // the token is never sent to the browser. Trigger once, after the background
 // year-verify has finished for the imported playlist.
 app.post('/export-to-repo/:id', async (req, res) => {
-  const token = process.env.GITHUB_TOKEN;
+  const token = req.body?.token || process.env.GITHUB_TOKEN;
   if (!token) return res.status(500).json({ error: 'GITHUB_TOKEN not set in environment' });
 
   const pl = loadPlaylists().find(p => p.spotifyId === req.params.id);
